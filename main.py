@@ -1,9 +1,10 @@
 """Mean-reversion BTC bot for make.fun's "Race a BTC trading bot live for 24 hours".
 
 Strategy (long only, one position, full size):
-  - Entry: the 21-bar RSI crosses back above 30 after dipping below it — an
-    oversold bounce with confirmation, instead of catching a falling knife.
-  - Exit: RSI rises above 75 (overbought), or the position gains 2% over its
+  - Entry: the 21-bar RSI crosses back above 35 after dipping below it — an
+    oversold bounce with confirmation. Require a 30-bar mean true range
+    of at least 5 bps of price to avoid buying tiny, fee-dominated moves.
+  - Exit: RSI rises above 75 (overbought), or the position gains 1.5% over its
     cost (take profit), or it loses 2% against its cost (stop loss).
   - No new entries in the last 120 bars of the 1440-bar window: a trade needs
     time to mature, and a position opened at the end is flattened at the last
@@ -19,16 +20,19 @@ the same bars send the same orders. Standard library only, no network.
 
 import os
 import sys
+from collections import deque
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars  # noqa: E402
 
 SYMBOL = "CBBTC"
 RSI_BARS = 21
-RSI_OVERSOLD = 30.0
+RSI_OVERSOLD = 35.0
 RSI_OVERBOUGHT = 75.0
 STOP_BPS = 200
-TAKE_PROFIT_BPS = 200
+TAKE_PROFIT_BPS = 150
+ATR_BARS = 30
+MIN_ATR_BPS = 5
 # No new entries once fewer than this many bars of the window remain.
 NO_ENTRY_LAST_BARS = 120
 WINDOW_BARS = 1440
@@ -78,6 +82,7 @@ class Rsi:
 
 
 rsi = Rsi(RSI_BARS)
+true_ranges = deque(maxlen=ATR_BARS)
 
 
 def on_batch(state, batch):
@@ -89,7 +94,14 @@ def on_batch(state, batch):
             break
     if bar is None:
         return []
-    rsi.push(int(bar["c"]))
+    close = int(bar["c"])
+    if rsi.prev_close is not None:
+        true_ranges.append(max(
+            int(bar["h"]) - int(bar["l"]),
+            abs(int(bar["h"]) - rsi.prev_close),
+            abs(int(bar["l"]) - rsi.prev_close),
+        ))
+    rsi.push(close)
     if state.warming_up:
         return []
 
@@ -101,6 +113,12 @@ def on_batch(state, batch):
         if rsi.prev_value >= RSI_OVERSOLD or rsi.value < RSI_OVERSOLD:
             return []
         if state.seq >= state.warmup_bars + WINDOW_BARS - NO_ENTRY_LAST_BARS:
+            return []
+        # A volatility floor leaves room for a bounce to cover round-trip costs.
+        # Compare the simple mean true range to price using integers only.
+        if len(true_ranges) < ATR_BARS:
+            return []
+        if sum(true_ranges) * 10000 < close * ATR_BARS * MIN_ATR_BPS:
             return []
         cash = state.cash
         min_notional = int(state.hello["fees"]["min_notional_quote_units"])
